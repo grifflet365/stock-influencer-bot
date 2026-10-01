@@ -22,6 +22,11 @@ def load_json(path, default):
     return default
 
 
+def tweet_time(t):
+    """ツイートIDに埋め込まれた作成時刻(UNIX秒)。"""
+    return ((int(t["id"]) >> 22) + 1288834974657) // 1000
+
+
 def search_new(api_key, accounts, since):
     """since以降の対象アカウントのツイートを返す。失敗時は None。"""
     query = " OR ".join(f"from:{a}" for a in accounts) + f" since_time:{since}"
@@ -42,7 +47,12 @@ def search_new(api_key, accounts, since):
             return None
         body = res.json()
         body = body.get("data", body) if "tweets" not in body else body
-        tweets += body.get("tweets", [])
+        page = [t for t in body.get("tweets", []) if str(t.get("id", "")).isdigit()]
+        fresh = [t for t in page if tweet_time(t) >= since]
+        tweets += fresh
+        # since_timeが効かず古いツイートが返ってきた場合は、それ以降のページを取らない(クレジット保護)
+        if len(fresh) < len(page):
+            break
         if not body.get("has_next_page") or not body.get("next_cursor"):
             break
         cursor = body["next_cursor"]
