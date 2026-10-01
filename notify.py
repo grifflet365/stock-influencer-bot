@@ -29,7 +29,8 @@ def tweet_time(t):
 
 def search_new(api_key, accounts, since):
     """since以降の対象アカウントのツイートを返す。失敗時は None。"""
-    query = " OR ".join(f"from:{a}" for a in accounts) + f" since_time:{since}"
+    # 括弧が必須。ないとsince_timeが最後のfrom:にしか効かない
+    query = "(" + " OR ".join(f"from:{a}" for a in accounts) + f") since_time:{since}"
     tweets, cursor = [], ""
     for _ in range(MAX_PAGES):
         try:
