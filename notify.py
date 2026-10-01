@@ -10,7 +10,10 @@ BASE = Path(__file__).parent
 CONFIG_PATH = BASE / "config.json"
 STATE_PATH = BASE / "state.json"
 
-API_URL = "https://api.twitterapi.io/twitter/user/last_tweets"
+SEARCH_URL = "https://api.twitterapi.io/twitter/tweet/advanced_search"
+OVERLAP_SEC = 600  # 検索インデックスの反映遅れ対策。前回時刻から少し遡って検索し、IDで重複を除く
+MAX_PAGES = 5
+MAX_SEEN = 1000
 
 
 def load_json(path, default):
@@ -19,22 +22,32 @@ def load_json(path, default):
     return default
 
 
-def get_tweets(api_key, username):
-    """最新ツイートを返す。取得失敗時は None(空と区別する)。"""
-    try:
-        res = requests.get(
-            API_URL,
-            headers={"x-api-key": api_key},
-            params={"userName": username},
-            timeout=20,
-        )
-    except requests.RequestException as e:
-        print(f"[ERROR] {username}: {e}")
-        return None
-    if res.status_code != 200:
-        print(f"[ERROR] {username}: HTTP {res.status_code}")
-        return None
-    return res.json().get("data", {}).get("tweets", [])
+def search_new(api_key, accounts, since):
+    """since以降の対象アカウントのツイートを返す。失敗時は None。"""
+    query = " OR ".join(f"from:{a}" for a in accounts) + f" since_time:{since}"
+    tweets, cursor = [], ""
+    for _ in range(MAX_PAGES):
+        try:
+            res = requests.get(
+                SEARCH_URL,
+                headers={"x-api-key": api_key},
+                params={"query": query, "queryType": "Latest", "cursor": cursor},
+                timeout=30,
+            )
+        except requests.RequestException as e:
+            print(f"[ERROR] search: {e}")
+            return None
+        if res.status_code != 200:
+            print(f"[ERROR] search: HTTP {res.status_code}")
+            return None
+        body = res.json()
+        body = body.get("data", body) if "tweets" not in body else body
+        tweets += body.get("tweets", [])
+        if not body.get("has_next_page") or not body.get("next_cursor"):
+            break
+        cursor = body["next_cursor"]
+        time.sleep(1)
+    return tweets
 
 
 def is_retweet(t):
@@ -77,44 +90,44 @@ def main():
         sys.exit(1)
 
     accounts = load_json(CONFIG_PATH, {}).get("accounts", [])
-    state = load_json(STATE_PATH, {})  # {username: 最新の既読ツイートID(int)}
-    failed = False
+    state = load_json(STATE_PATH, {})  # {"last_checked": UNIX秒, "seen_ids": [...]}
+    now = int(time.time())
 
-    for i, username in enumerate(accounts):
-        if i:
-            time.sleep(3)
-        tweets = get_tweets(api_key, username)
-        if tweets is None:
-            failed = True
-            continue
-        tweets = [t for t in tweets if str(t.get("id", "")).isdigit()]
-        if not tweets:
-            print(f"[CHECK] @{username}: 0 tweets")
-            continue
+    # 初回(旧形式のstate含む)は時刻を記録するだけ。APIは呼ばず、通知もしない
+    if "last_checked" not in state:
+        STATE_PATH.write_text(
+            json.dumps({"last_checked": now, "seen_ids": []}, indent=2), encoding="utf-8"
+        )
+        print(f"[INIT] last_checked={now}")
+        return
 
-        # 初回は既読登録のみ(通知しない)
-        if username not in state:
-            state[username] = max(int(t["id"]) for t in tweets)
-            print(f"[INIT] @{username}: last_id={state[username]}")
-            continue
+    tweets = search_new(api_key, accounts, state["last_checked"] - OVERLAP_SEC)
+    if tweets is None:
+        sys.exit(1)  # stateは更新しない(次回同じ範囲を再取得)
 
-        last_id = state[username]
-        new = sorted((t for t in tweets if int(t["id"]) > last_id), key=lambda t: int(t["id"]))
-        sent = 0
-        for t in new:
-            tid = int(t["id"])
-            if not is_retweet(t):
-                name = t.get("author", {}).get("name", username)
-                url = f"https://x.com/{username}/status/{tid}"
-                if not send_discord(webhook, username, name, t.get("text", ""), url):
-                    failed = True
-                    break  # 失敗分は既読にせず次回再送
-                sent += 1
-                time.sleep(1)
-            last_id = tid
-        state[username] = last_id
-        print(f"[CHECK] @{username}: {sent} new tweets")
+    seen = set(state.get("seen_ids", []))
+    new = sorted(
+        (t for t in tweets if str(t.get("id", "")).isdigit() and int(t["id"]) not in seen),
+        key=lambda t: int(t["id"]),
+    )
+    sent, failed = 0, False
+    for t in new:
+        tid = int(t["id"])
+        if not is_retweet(t):
+            author = t.get("author", {})
+            username = author.get("userName", "")
+            url = f"https://x.com/{username}/status/{tid}"
+            if not send_discord(webhook, username, author.get("name", username), t.get("text", ""), url):
+                failed = True
+                continue  # 失敗分は既読にせず次回再送
+            sent += 1
+            time.sleep(1)
+        seen.add(tid)
+    print(f"[CHECK] fetched={len(tweets)} new={len(new)} sent={sent}")
 
+    state["seen_ids"] = sorted(seen)[-MAX_SEEN:]
+    if not failed:
+        state["last_checked"] = now
     STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
     if failed:
         sys.exit(1)
