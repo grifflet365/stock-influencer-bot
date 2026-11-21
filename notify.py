@@ -13,6 +13,7 @@ STATE_PATH = BASE / "state.json"
 SEARCH_URL = "https://api.twitterapi.io/twitter/tweet/advanced_search"
 OVERLAP_SEC = 600  # 検索インデックスの反映遅れ対策。前回時刻から少し遡って検索し、IDで重複を除く
 MAX_PAGES = 5
+SEARCH_RETRIES = 3
 MAX_SEEN = 1000
 
 
@@ -33,15 +34,27 @@ def search_new(api_key, accounts, since):
     query = "(" + " OR ".join(f"from:{a}" for a in accounts) + f") since_time:{since}"
     tweets, cursor = [], ""
     for _ in range(MAX_PAGES):
-        try:
-            res = requests.get(
-                SEARCH_URL,
-                headers={"x-api-key": api_key},
-                params={"query": query, "queryType": "Latest", "cursor": cursor},
-                timeout=30,
-            )
-        except requests.RequestException as e:
-            print(f"[ERROR] search: {e}")
+        res = None
+        for attempt in range(SEARCH_RETRIES):
+            try:
+                res = requests.get(
+                    SEARCH_URL,
+                    headers={"x-api-key": api_key},
+                    params={"query": query, "queryType": "Latest", "cursor": cursor},
+                    timeout=30,
+                )
+            except requests.RequestException as e:
+                print(f"[WARN] search attempt {attempt + 1}/{SEARCH_RETRIES}: {e}")
+                res = None
+            else:
+                # 429/5xxのみ再試行。認証エラー等の4xxは即失敗(クレジット保護)
+                if res.status_code != 429 and res.status_code < 500:
+                    break
+                print(f"[WARN] search attempt {attempt + 1}/{SEARCH_RETRIES}: HTTP {res.status_code}")
+            if attempt < SEARCH_RETRIES - 1:
+                time.sleep(5 * 3**attempt)  # 5秒, 15秒
+        if res is None:
+            print("[ERROR] search: retries exhausted")
             return None
         if res.status_code != 200:
             print(f"[ERROR] search: HTTP {res.status_code}")
